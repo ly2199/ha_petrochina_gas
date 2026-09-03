@@ -17,7 +17,7 @@ Home Assistant 自定义集成,用于查询**中石油昆仑燃气**(云南昆�
 ### 方式一:HACS(推荐)
 
 1. HACS → 右上角 `⋯` → **自定义存储库 (Custom repositories)**
-2. 存储库地址填 `https://github.com/ly2199/petrochina_gas`,类别选 **集成 (Integration)** → 添加
+2. 存储库地址填 `https://github.com/ly2199/ha_petrochina_gas`,类别选 **集成 (Integration)** → 添加
 3. 在 HACS 中搜索 **中石油燃气统计 (PetroChina Gas)** → 下载 → **重启 Home Assistant**
 
 ### 方式二:手动安装
@@ -63,7 +63,7 @@ Home Assistant 自定义集成,用于查询**中石油昆仑燃气**(云南昆�
 - 数据接口:`https://bol.grs.petrochina.com.cn`(中石油燃气云平台)
 - 本项目**非中国石油官方**发布,仅供个人学习与使用
 - 请勿设置过高的刷新频率,以免对燃气公司服务器造成压力
-- 燃气云平台接口如有调整导致集成失效,请在 [Issues](https://github.com/ly2199/petrochina_gas/issues) 反馈
+- 燃气云平台接口如有调整导致集成失效,请在 [Issues](https://github.com/ly2199/ha_petrochina_gas/issues) 反馈
 
 ## 许可
 
