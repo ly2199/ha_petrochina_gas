@@ -67,4 +67,4 @@ Home Assistant 自定义集成,用于查询**中石油昆仑燃气**(云南昆�
 
 ## 许可
 
-保留所有权利 (All rights reserved)。未经作者许可,请勿用于商业用途。
+原项目来源：https://github.com/mubeyout/HAOS.git，本仓库做部分修改。未经作者许可,请勿用于商业用途。
