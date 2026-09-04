@@ -98,6 +98,17 @@ from .gas_client import GasHttpClient
 _LOGGER = logging.getLogger(__name__)
 
 
+
+def get_company_display_name(mdm_code: Optional[str] = None, cid: Optional[int] = None) -> str:
+    """根据 mdmCode / cid 返回燃气公司显示名称（目前适配红河/昆明）。"""
+    if mdm_code == "9AHA" or cid == 5000000883:
+        return "红河中石油昆仑燃气有限公司"
+    if mdm_code == "9AH1" or cid == 2:
+        return "云南中石油昆仑燃气有限公司昆明分公司"
+    if mdm_code == "9A99" or cid == 99999:
+        return "昆仑慧享+"
+    return "中石油昆仑燃气"
+
 def parse_datetime(datetime_str: str) -> Optional[datetime]:
     """解析时间字符串为 datetime 对象（带时区）"""
     if not datetime_str or datetime_str == "未知":
@@ -304,7 +315,7 @@ class GasCustomerInfoSensor(GasBaseSensor):
     ) -> None:
         super().__init__(coordinator, account_number, "gas_company")
         self._attr_extra_state_attributes = {
-            "company_name": "云南中石油昆仑燃气有限公司昆明分公司",
+            "company_name": "中石油昆仑燃气",
             "company_type": "天然气",
         }
 
@@ -673,7 +684,7 @@ class GasCoordinator(DataUpdateCoordinator):
         # 如果有手机号和密码，尝试自动登录
         if mobile and password:
             # 检查是否已登录且token仍然有效
-            if self._logged_in.get(user_code, False) and client._token:
+            if self._logged_in.get(user_code, False) and client._get_auth_token():
                 _LOGGER.debug(f"Already logged in for {user_code}, skipping login")
             else:
                 try:
@@ -793,7 +804,7 @@ class GasCoordinator(DataUpdateCoordinator):
                     "meter_type": user_debt.meter_type,
                     "mdm_code": user_debt.mdm_code,
                     "user_code": user_debt.user_code,
-                    "gas_company": "云南中石油昆仑燃气有限公司昆明分公司",
+                    "gas_company": get_company_display_name(user_debt.mdm_code, cid),
                 })
                 if user_debt.mdm_code:
                     client._mdm_code = user_debt.mdm_code
@@ -802,8 +813,8 @@ class GasCoordinator(DataUpdateCoordinator):
             _LOGGER.error(f"Error getting user debt for {user_code}: {err}")
 
         # 2. 如果已登录，获取认证后的数据
-        has_auth = hasattr(client, '_token') and client._token and client._mdm_code
-        _LOGGER.info(f"Checking auth for {user_code}: has_token={bool(client._token)}, has_mdm={bool(client._mdm_code)}")
+        has_auth = hasattr(client, '_get_auth_token') and bool(client._get_auth_token()) and bool(client._mdm_code)
+        _LOGGER.info(f"Checking auth for {user_code}: has_token={bool(client._get_auth_token())}, has_mdm={bool(client._mdm_code)}")
 
         if has_auth:
             # 获取缴费记录
@@ -1088,7 +1099,7 @@ class GasCoordinator(DataUpdateCoordinator):
                     "meter_type": user_debt.meter_type,
                     "mdm_code": user_debt.mdm_code,
                     "user_code": user_debt.user_code,
-                    "gas_company": "云南中石油昆仑燃气有限公司昆明分公司",
+                    "gas_company": get_company_display_name(user_debt.mdm_code, cid),
                 })
                 # 设置 mdm_code 到 client
                 if user_debt.mdm_code:
@@ -1098,7 +1109,7 @@ class GasCoordinator(DataUpdateCoordinator):
 
         # 设置默认值避免传感器显示未知
         defaults = {
-            "gas_company": "云南中石油昆仑燃气有限公司昆明分公司",
+            "gas_company": get_company_display_name(None, cid),
             SUFFIX_LAST_PAYMENT: 0,
             ATTR_KEY_LAST_PAYMENT_DATE: "加载中...",
             SUFFIX_OWE_AMOUNT: 0,

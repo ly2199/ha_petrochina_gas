@@ -44,6 +44,7 @@ FIELD_SUCCESS_WITH_DATA = "successWithData"
 
 # API Base URL
 API_BASE = "https://bol.grs.petrochina.com.cn"
+API_SIGN_KEY = "d7b85f6e214abcda"  # 网上营业厅 close 接口签名密钥
 
 # Data Fields
 DATA_ACCOUNT_ID = "accountId"

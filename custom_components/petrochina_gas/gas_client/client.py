@@ -4,6 +4,7 @@ import logging
 import requests
 import json
 import base64
+import hashlib
 from typing import Optional, Tuple, Dict, Any
 from cryptography.hazmat.primitives import serialization, hashes
 from cryptography.hazmat.primitives.asymmetric import rsa, padding
@@ -11,6 +12,7 @@ from cryptography.hazmat.backends import default_backend
 
 from .const import (
     API_BASE,
+    API_SIGN_KEY,
     API_USER_AUTH,
     API_PASSWORD_LOGIN,
     API_GET_COMPANIES,
@@ -108,11 +110,14 @@ class GasHttpClient:
         """
         if token:
             self._token = token
-            self._session.headers["token"] = token
             _LOGGER.info(f"✅ Token set: {token[:20]}...")
         if refresh_token:
             self._refresh_token = refresh_token
             _LOGGER.info(f"✅ Refresh token set: {refresh_token[:20]}...")
+        # close 接口实际使用 refreshToken 作为 token 请求头
+        auth_token = self._refresh_token or self._token
+        if auth_token:
+            self._session.headers["token"] = auth_token
         if union_id:
             self._union_id = union_id
             _LOGGER.debug(f"UnionID set: {union_id[:20]}...")
@@ -138,6 +143,42 @@ class GasHttpClient:
             "open_id": self._open_id,
         }
 
+    def _get_auth_token(self) -> Optional[str]:
+        """获取用于 close 接口的凭证。
+
+        实测网上营业厅 close 接口需要把 refreshToken 放到 token 头才有效。
+        """
+        return self._refresh_token or self._token
+
+    def _build_signed_headers(self, data: Optional[dict]) -> dict:
+        """构造网上营业厅 close 接口签名头。
+
+        规则：
+        1. 请求体字段 + timestamp + token
+        2. 按 key 字典序排序
+        3. 拼接 key=value&... + API_SIGN_KEY
+        4. MD5 得到 signature
+        """
+        auth_token = self._get_auth_token()
+        if not auth_token:
+            return {}
+        ts = int(__import__('time').time() * 1000)
+        entries = []
+        body = data or {}
+        for key, value in body.items():
+            entries.append((key, value))
+        entries.append(('timestamp', ts))
+        entries.append(('token', auth_token))
+        entries.sort(key=lambda item: str(item[0]))
+        raw = '&'.join(f'{k}={v}' for k, v in entries) + API_SIGN_KEY
+        signature = hashlib.md5(raw.encode('utf-8')).hexdigest()
+        return {
+            'token': auth_token,
+            'timestamp': str(ts),
+            'signature': signature,
+            'X-Requested-With': 'XMLHttpRequest',
+        }
+
     def _make_request(self, url: str, method: str = "POST", data: Optional[dict] = None,
                    requires_auth: bool = False, retry_after_refresh: bool = True) -> requests.Response:
         """发送HTTP请求（支持自动刷新Token和重试）"""
@@ -146,9 +187,10 @@ class GasHttpClient:
 
         # 如果需要认证且已有token，添加到请求头
         if requires_auth:
-            if self._token:
-                headers["token"] = self._token
-                _LOGGER.debug(f"🔐 Using token for auth: {self._token[:20]}...")
+            auth_token = self._get_auth_token()
+            if auth_token:
+                headers.update(self._build_signed_headers(data))
+                _LOGGER.debug(f"🔐 Using token for auth: {auth_token[:20]}...")
             else:
                 _LOGGER.warning(f"⚠️  Auth required but no token available!")
 
@@ -245,9 +287,10 @@ class GasHttpClient:
                 _LOGGER.info(f"Login successful for user: {data.get('mobile', 'unknown')}")
                 _LOGGER.debug(f"MDM code: {self._mdm_code}")
 
-                # 更新session默认请求头，添加token
-                if self._token:
-                    self._session.headers["token"] = self._token
+                # 更新session默认请求头，close 接口优先用 refreshToken
+                auth_token = self._refresh_token or self._token
+                if auth_token:
+                    self._session.headers["token"] = auth_token
 
                 return True
             else:
@@ -259,8 +302,8 @@ class GasHttpClient:
             return False
 
     def is_logged_in(self) -> bool:
-        """检查是否已登录"""
-        return self._token is not None
+        """检查是否已登录（token 或 refresh_token 任一存在即可）"""
+        return bool(self._token or self._refresh_token)
 
     def refresh_access_token(self) -> bool:
         """
@@ -579,58 +622,51 @@ class GasHttpClient:
             _LOGGER.debug(traceback.format_exc())
             return None
 
+
+    def _encrypt_web_aes(self, plaintext: str) -> Optional[str]:
+        """
+        使用网页版固定 AES Key 加密（网上营业厅/公众号 H5 同款）。
+
+        算法：AES-192-ECB / PKCS7
+        Key：F9ce3yf0GPpbtal2YOE/Vg==（按 UTF-8 取 24 字节）
+        """
+        try:
+            from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+            from cryptography.hazmat.primitives.padding import PKCS7
+
+            key = b"F9ce3yf0GPpbtal2YOE/Vg=="  # 24 bytes => AES-192
+            padder = PKCS7(128).padder()
+            padded = padder.update(plaintext.encode('utf-8')) + padder.finalize()
+            cipher = Cipher(algorithms.AES(key), modes.ECB(), backend=default_backend())
+            encryptor = cipher.encryptor()
+            encrypted = encryptor.update(padded) + encryptor.finalize()
+            return base64.b64encode(encrypted).decode('utf-8')
+        except Exception as err:
+            _LOGGER.error(f"❌ Web AES encryption failed: {err}")
+            return None
     def password_login(self, mobile: str, password: str, company_id: Optional[int] = None, cached_aes_key: Optional[str] = None) -> bool:
         """
-        使用手机号和密码登录（网页版）
+        使用手机号和密码登录（网上营业厅/公众号网页版）
 
-        加密流程：
-        1. 尝试使用缓存的 AES 密钥（如果提供）
-        2. 如果没有缓存，通过 RSA 密钥交换获取 AES 密钥
-        3. 使用 AES-128-ECB 加密手机号和密码
-        4. 调用登录 API
-
-        Args:
-            mobile: 手机号
-            password: 密码（明文，将使用 AES 加密）
-            company_id: 燃气公司 ID（可选）
-            cached_aes_key: 缓存的 AES 密钥（可选，用于跳过密钥交换）
-
-        Returns:
-            登录是否成功
+        加密方式：固定 AES Key + AES-ECB/PKCS7
+        Key：F9ce3yf0GPpbtal2YOE/Vg==（UTF-8 24字节）
         """
         _LOGGER.info(f"🔐 Attempting password login for: {mobile}")
 
-        # 步骤1: 获取 AES 密钥（优先使用缓存）
-        aes_key = cached_aes_key or self._cached_aes_key
-        if not aes_key:
-            aes_key = self._get_aes_key()
-            if aes_key:
-                self._cached_aes_key = aes_key  # 缓存供后续使用
-                _LOGGER.info("✅ AES key cached for future use")
-
-        if not aes_key:
-            _LOGGER.error("❌ Failed to get AES key, cannot encrypt credentials")
+        encrypted_mobile = self._encrypt_web_aes(mobile)
+        encrypted_password = self._encrypt_web_aes(password)
+        if not encrypted_mobile or not encrypted_password:
+            _LOGGER.error("❌ Failed to encrypt credentials with web AES")
             return False
-        else:
-            # 步骤2: 使用 AES 加密手机号和密码
-            encrypted_mobile = self._encrypt_with_aes(mobile, aes_key)
-            encrypted_password = self._encrypt_with_aes(password, aes_key)
-
-            if not encrypted_mobile or not encrypted_password:
-                _LOGGER.error("❌ Failed to encrypt credentials with AES")
-                return False
 
         _LOGGER.debug(f"Encrypted mobile: {encrypted_mobile[:20]}...")
         _LOGGER.debug(f"Encrypted password: {encrypted_password[:20]}...")
 
-        # 步骤3: 调用登录 API
         url = API_PASSWORD_LOGIN
         data = {
             "mobile": encrypted_mobile,
             "password": encrypted_password,
         }
-
-        # 如果提供了 company_id，添加到请求中
         if company_id:
             data["companyId"] = company_id
 
@@ -638,43 +674,45 @@ class GasHttpClient:
             response = self._make_request(url, data=data, requires_auth=False)
             content = response.content.decode('utf-8')
 
-            # 响应可能是 base64 编码
+            # 兼容可能的 base64 包裹响应
             if content and not content.strip().startswith('{'):
-                decoded_bytes = base64.b64decode(content)
-                content = decoded_bytes.decode('utf-8')
+                try:
+                    decoded_bytes = base64.b64decode(content)
+                    content = decoded_bytes.decode('utf-8')
+                except Exception:
+                    pass
 
             result = json.loads(content)
 
-            # 检查响应格式
             if result.get(FIELD_SUCCESS) or result.get(FIELD_SUCCESS_WITH_DATA):
                 api_data = result.get(FIELD_DATA, {})
                 token = api_data.get("token")
                 refresh_token = api_data.get("refreshToken")
                 company_info = api_data.get("company")
 
+                if refresh_token:
+                    self._refresh_token = refresh_token
                 if token:
                     self._token = token
-                    self._session.headers["token"] = token
-                    _LOGGER.info(f"✅ Password login successful for: {mobile}")
 
-                    if refresh_token:
-                        self._refresh_token = refresh_token
-                        _LOGGER.info("✅ Refresh token received")
+                # 实测 close 接口需使用 refreshToken 作为 token 头
+                auth_token = self._refresh_token or self._token
+                if auth_token:
+                    self._session.headers["token"] = auth_token
 
-                    # 从 company 信息中获取 mdmCode
-                    if company_info:
-                        if isinstance(company_info, str):
-                            try:
-                                company_data = json.loads(company_info)
-                                self._mdm_code = company_data.get("mdmCode")
-                                _LOGGER.info(f"✅ MDM code from company: {self._mdm_code}")
-                            except json.JSONDecodeError:
-                                _LOGGER.warning("⚠️  Failed to parse company info")
-                        elif isinstance(company_info, dict):
-                            self._mdm_code = company_info.get("mdmCode")
-                            _LOGGER.info(f"✅ MDM code from company: {self._mdm_code}")
+                # 尝试从返回信息中获取 mdmCode
+                if company_info:
+                    if isinstance(company_info, str):
+                        try:
+                            company_data = json.loads(company_info)
+                            self._mdm_code = company_data.get("mdmCode")
+                        except json.JSONDecodeError:
+                            pass
+                    elif isinstance(company_info, dict):
+                        self._mdm_code = company_info.get("mdmCode")
 
-                    return True
+                _LOGGER.info(f"✅ Password login successful for: {mobile}")
+                return True
             else:
                 _LOGGER.error(f"❌ Password login failed: {result.get(FIELD_MESSAGE, 'Unknown error')}")
                 return False
@@ -706,11 +744,13 @@ class GasHttpClient:
         response = self._make_request(url, data=data, requires_auth=True)
         result = self._parse_response(response)
 
-        if "error" in result:
+        if isinstance(result, dict) and "error" in result:
             _LOGGER.error(f"Failed to get user code list: {result['error']}")
             return None
 
-        return result.get("data", [])
+        if isinstance(result, list):
+            return result
+        return result.get("data", []) if isinstance(result, dict) else []
 
     def get_user_debt(self) -> Optional[GasAccount]:
         """
@@ -720,7 +760,7 @@ class GasHttpClient:
             包含余额等信息的字典
         """
         # 如果有 token，使用 close API 获取完整数据（包括 userCodeList）
-        if self._token:
+        if self._get_auth_token():
             url = API_GET_USER_DEBT_AUTH
         else:
             url = API_GET_USER_DEBT
@@ -732,7 +772,7 @@ class GasHttpClient:
         }
 
         # 如果有 token，使用认证请求以获取完整的 userCodeList
-        requires_auth = bool(self._token)
+        requires_auth = bool(self._get_auth_token())
 
         _LOGGER.info(f"Querying user debt: {self.user_code}")
         response = self._make_request(url, data=data, requires_auth=requires_auth)
@@ -1097,8 +1137,9 @@ class GasHttpClient:
                 self._mdm_code = mdm_code
 
                 # 更新session请求头
-                if self._token:
-                    self._session.headers["token"] = self._token
+                auth_token = self._refresh_token or self._token
+                if auth_token:
+                    self._session.headers["token"] = auth_token
 
                 _LOGGER.info(f"QR login successful, token received")
                 if refresh_token:
