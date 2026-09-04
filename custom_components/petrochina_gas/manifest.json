@@ -1,7 +1,9 @@
 {
   "domain": "petrochina_gas",
   "name": "PetroChina Gas Statistics",
-  "codeowners": ["@ly2199"],
+  "codeowners": [
+    "@ly2199"
+  ],
   "config_flow": true,
   "dependencies": [],
   "documentation": "https://github.com/ly2199/ha_petrochina_gas",
@@ -10,6 +12,6 @@
   "iot_class": "local_polling",
   "requirements": [],
   "ssdp": [],
-  "version": "1.0.1",
+  "version": "1.0.2",
   "zeroconf": []
 }

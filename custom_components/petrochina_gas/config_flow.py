@@ -4,6 +4,7 @@
 import copy
 import logging
 import time
+import requests
 from typing import Any, Optional
 
 import voluptuous as vol
@@ -46,6 +47,15 @@ from .gas_client import (
 
 _LOGGER = logging.getLogger(__name__)
 
+# 静态备用公司列表（动态拉取失败时使用）
+FALLBACK_COMPANY_OPTIONS = [
+    "5000000883 - 云南红河：红河中石油昆仑燃气有限公司（9AHA）",
+    "2 - 云南昆明：云南中石油昆仑燃气有限公司昆明分公司（9AH1）",
+    "5000000020 - 测试：平安国际燃气（ZZ11）",
+]
+
+GAS_COMPANY_API = "https://bol.grs.petrochina.com.cn/api/v1/open/home/getGasCompanyList"
+
 
 class PetrochinaGasConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     """Handle a config flow for PetroChina Gas Statistics."""
@@ -61,44 +71,109 @@ class PetrochinaGasConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         """Create the options flow."""
         return PetrochinaGasOptionsFlowHandler(config_entry)
 
+    def _fetch_company_options(self) -> list[str]:
+        """从接口拉取燃气公司列表，失败时返回备用列表。"""
+        try:
+            resp = requests.post(
+                GAS_COMPANY_API,
+                json={},
+                headers={
+                    "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 MicroMessenger/8.0.47(0x18002f2f) NetType/WIFI Language/zh_CN",
+                    "Accept": "application/json, text/plain, */*",
+                    "Origin": "https://bol.grs.petrochina.com.cn",
+                    "Referer": "https://bol.grs.petrochina.com.cn/",
+                },
+                timeout=15,
+            )
+            resp.raise_for_status()
+            payload = resp.json()
+            options = []
+            for area in payload.get("data", []):
+                area_name = ""
+                if isinstance(area, dict) and isinstance(area.get("area"), dict):
+                    area_name = area["area"].get("name", "") or ""
+                company_groups = area.get("companyList", {}) if isinstance(area, dict) else {}
+                if not isinstance(company_groups, dict):
+                    continue
+                for group in company_groups.values():
+                    if not isinstance(group, list):
+                        continue
+                    for comp in group:
+                        if not isinstance(comp, dict):
+                            continue
+                        cid = comp.get("id")
+                        name = comp.get("name", "")
+                        mdm = comp.get("mdmCode", "")
+                        if cid and name:
+                            options.append(f"{cid} - {area_name}：{name}（{mdm}）")
+            if options:
+                # 云南红河排前面，方便选择
+                honghe = [o for o in options if "9AHA" in o or "5000000883" in o]
+                rest = [o for o in options if o not in honghe]
+                return honghe + sorted(rest)
+        except Exception as err:
+            _LOGGER.warning("Failed to fetch company list, use fallback: %s", err)
+        return list(FALLBACK_COMPANY_OPTIONS)
+
+    @staticmethod
+    def _parse_company_option(option: str) -> Optional[int]:
+        """从公司选项字符串中解析 cid。"""
+        try:
+            return int(str(option).split(" - ", 1)[0].strip())
+        except (ValueError, TypeError, IndexError):
+            return None
+
     async def async_step_user(
         self, user_input: Optional[dict[str, Any]] = None
     ) -> FlowResult:
         """Handle the initial step - show account form directly."""
-        # terminal_type 使用默认值
         DEFAULT_TERMINAL_TYPE = 7
 
         if user_input is None:
+            # 拉取燃气公司列表，做成下拉选择
+            company_options = await self.hass.async_add_executor_job(
+                self._fetch_company_options
+            )
+            # 默认选中云南红河（如果存在）
+            default_company = company_options[0] if company_options else FALLBACK_COMPANY_OPTIONS[0]
+            for option in company_options:
+                if "红河" in option or "9AHA" in option:
+                    default_company = option
+                    break
+
+            schema = vol.Schema({
+                vol.Required(CONF_USER_CODE): vol.All(
+                    str, vol.Length(min=1), msg="请输入燃气户号"
+                ),
+                vol.Required(CONF_COMPANY_ID, default=default_company): vol.In(company_options),
+                vol.Optional(CONF_MOBILE): str,
+                vol.Optional(CONF_PASSWORD): str,
+            })
             return self.async_show_form(
                 step_id=STEP_USER,
-                data_schema=vol.Schema({
-                    vol.Required(CONF_USER_CODE): vol.All(
-                        str, vol.Length(min=8, max=8), msg="请输入8位燃气户号"
-                    ),
-                    vol.Required(CONF_CID, default=2): int,
-                    vol.Optional(CONF_MOBILE): str,
-                    vol.Optional(CONF_PASSWORD): str,
-                }),
+                data_schema=schema,
                 description_placeholders={
                     "description": "<p>请输入您的燃气户号和登录凭证。</p>"
-                    "<p>手机号和密码为选填，填写后可自动登录获取详细数据（缴费记录、用气统计等）。</p>"
-                    "<p>如不填写，仅使用公开API获取基础余额信息。</p>"
-                    "<p>地区代码：昆明=2，其他地区请咨询燃气公司。</p>"
+                    "<p>燃气户号支持 8~20 位，实际以燃气公司户号为准。</p>"
+                    "<p>请选择您所属的省/燃气公司。</p>"
+                    "<p>手机号和密码为选填，填写后可自动登录获取详细数据。</p>"
                 },
             )
 
-        user_code = user_input.get(CONF_USER_CODE)
-        cid = user_input.get(CONF_CID, 2)
+        user_code = str(user_input.get(CONF_USER_CODE, "")).strip()
+        company_option = str(user_input.get(CONF_COMPANY_ID, "")).strip()
+        cid = self._parse_company_option(company_option)
+        if cid is None:
+            # 兼容老配置直接填数字 cid
+            cid = user_input.get(CONF_CID, 2)
         terminal_type = DEFAULT_TERMINAL_TYPE
 
-        # 收集认证信息（不再收集 company_id，自动检测）
         auth_settings = {}
         if user_input.get(CONF_MOBILE):
             auth_settings[CONF_MOBILE] = user_input[CONF_MOBILE]
         if user_input.get(CONF_PASSWORD):
             auth_settings[CONF_PASSWORD] = user_input[CONF_PASSWORD]
 
-        # 设置唯一ID
         await self.async_set_unique_id(f"GAS-{user_code}")
 
         return await self._create_or_update_config_entry(
