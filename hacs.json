@@ -1,5 +1,9 @@
 {
   "name": "中石油燃气统计 (PetroChina Gas)",
   "render_readme": true,
-  "homeassistant": "2024.6.0"
+  "homeassistant": "2024.6.0",
+  "domain": "petrochina_gas",
+  "country": [
+    "CN"
+  ]
 }
