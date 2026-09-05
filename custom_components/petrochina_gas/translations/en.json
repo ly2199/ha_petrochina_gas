@@ -5,10 +5,10 @@
         "title": "Configure PetroChina Gas",
         "description": "Please enter your gas account information and login credentials",
         "data": {
-          "user_code": "Gas User Code (8 digits, required)",
-          "cid": "Region Code (required, default 2=Kunming)",
+          "user_code": "Gas User Code (required)",
           "mobile": "Mobile Number (optional, for auto-login)",
-          "password": "Login Password (optional)"
+          "password": "Login Password (optional)",
+          "company_id": "Province / Gas Company"
         }
       },
       "add_account_direct": {
@@ -35,7 +35,7 @@
     "step": {
       "init": {
         "title": "Select Action",
-        "description": "Please select the setting to modify",
+        "description": "{description}",
         "data": {
           "action": "Action"
         }

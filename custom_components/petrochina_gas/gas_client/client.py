@@ -203,17 +203,10 @@ class GasHttpClient:
             response = self._session.post(full_url, json=data, headers=headers, timeout=60)
 
             # 检测 403 Forbidden (Token 过期)
-            if response.status_code == 403 and retry_after_refresh and requires_auth:
-                if self._refresh_token:
-                    _LOGGER.warning("⚠️  Got 403 Forbidden, attempting to refresh token...")
-                    if self.refresh_access_token():
-                        _LOGGER.info("✅ Token refreshed, retrying request...")
-                        # 重试请求（使用新的 token）
-                        return self._make_request(url, method, data, requires_auth, retry_after_refresh=False)
-                    else:
-                        _LOGGER.error("❌ Failed to refresh token, giving up")
-                else:
-                    _LOGGER.error("❌ No refresh_token available, cannot retry")
+            # 不再用 refreshToken 调 userAuthorization 刷新（该接口只收 code）
+            # 交由上层用手机号+密码重新登录，成功后重试
+            if response.status_code == 403 and requires_auth:
+                _LOGGER.warning("⚠️  Got 403 Forbidden, upper layer will re-login if credentials exist...")
 
             response.raise_for_status()
             return response

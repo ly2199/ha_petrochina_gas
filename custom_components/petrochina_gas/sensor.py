@@ -761,8 +761,10 @@ class GasCoordinator(DataUpdateCoordinator):
                     return result
                 except Exception as err:
                     error_str = str(err)
+                    resp_status = getattr(getattr(err, "response", None), "status_code", None)
+                    is_403 = "403" in error_str or resp_status == 403
                     # 检测403错误
-                    if "403" in error_str and attempt < max_retries:
+                    if is_403 and attempt < max_retries:
                         _LOGGER.warning(f"⚠️  Got 403 for {user_code}, attempting to re-login...")
 
                         # 尝试重新登录
