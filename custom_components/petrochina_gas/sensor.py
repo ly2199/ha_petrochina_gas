@@ -63,6 +63,8 @@ from .const import (
     CONF_MOBILE,
     CONF_PASSWORD,
     CONF_COMPANY_ID,
+    CONF_UPDATE_INTERVAL,
+    DEFAULT_UPDATE_INTERVAL,
     SUFFIX_BAL,
     SUFFIX_ADDRESS,
     SUFFIX_LADDER_STAGE,
@@ -640,13 +642,22 @@ class GasCoordinator(DataUpdateCoordinator):
 
     def __init__(self, hass: HomeAssistant, config_entry: ConfigEntry) -> None:
         """初始化协调器"""
+        # 刷新间隔取自配置（选项流程中可修改），最低60秒
+        settings = config_entry.data.get(CONF_SETTINGS, {})
+        try:
+            interval_seconds = max(
+                60, int(settings.get(CONF_UPDATE_INTERVAL, DEFAULT_UPDATE_INTERVAL))
+            )
+        except (TypeError, ValueError):
+            interval_seconds = DEFAULT_UPDATE_INTERVAL
+
         super().__init__(
             hass,
             _LOGGER,
+            config_entry=config_entry,
             name=DOMAIN,
-            update_interval=timedelta(hours=1),  # 每小时更新一次
+            update_interval=timedelta(seconds=interval_seconds),
         )
-        self._config_entry = config_entry
         self._config = config_entry.data
         self.data: Dict[str, Any] = {}
 

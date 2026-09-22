@@ -69,7 +69,9 @@ class PetrochinaGasConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         config_entry: config_entries.ConfigEntry,
     ) -> config_entries.OptionsFlow:
         """Create the options flow."""
-        return PetrochinaGasOptionsFlowHandler(config_entry)
+        # HA 2024.12+ 会自动提供 self.config_entry（只读属性），
+        # 不能再在 __init__ 中对其赋值
+        return PetrochinaGasOptionsFlowHandler()
 
     def _fetch_company_options(self) -> list[str]:
         """从接口拉取燃气公司列表，失败时返回备用列表。"""
@@ -251,10 +253,6 @@ class PetrochinaGasConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 class PetrochinaGasOptionsFlowHandler(config_entries.OptionsFlow):
     """Handle options flow for PetroChina Gas Statistics."""
 
-    def __init__(self, config_entry: config_entries.ConfigEntry) -> None:
-        """Initialize options flow."""
-        self.config_entry = config_entry
-
     async def async_step_init(
         self, user_input: Optional[dict[str, Any]] = None
     ) -> FlowResult:
@@ -306,7 +304,9 @@ class PetrochinaGasOptionsFlowHandler(config_entries.OptionsFlow):
                 self.config_entry,
                 data=new_data,
             )
-            return self.async_create_entry(title="", data=user_input)
+            # 数据已通过 async_update_entry 写入 entry.data，
+            # 这里返回空 options，避免二次触发更新监听导致重复 reload
+            return self.async_create_entry(title="", data={})
 
         return self.async_show_form(step_id=STEP_SETTINGS, data_schema=schema)
 
@@ -366,4 +366,6 @@ class PetrochinaGasOptionsFlowHandler(config_entries.OptionsFlow):
             data=new_data,
         )
 
-        return self.async_create_entry(title="", data=user_input)
+        # 数据已通过 async_update_entry 写入 entry.data，
+        # 这里返回空 options，避免二次触发更新监听导致重复 reload
+        return self.async_create_entry(title="", data={})
