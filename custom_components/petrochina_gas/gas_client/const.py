@@ -17,6 +17,12 @@ API_PASSWORD_LOGIN = "/api/v1/open/user/passwordLogin"
 API_GET_COMPANIES = "/api/v1/open/company/list"
 API_GET_RSA_PUBLIC_KEY = "/api/v1/open/encrypt/getRSA"
 
+# 2026-11 平台升级后的新接口（营业厅模式，无需户号绑定即可查询）
+API_GET_GAS_COMPANY_LIST = "/api/v1/open/home/getGasCompanyList"
+API_GET_USER_MESSAGE = "/api/v1/close/user/getUserMessage"
+API_GET_USER_GAS_VOLUME = "/api/v1/close/user/getUserGasVolume"
+API_GET_PAYMENT_RECORDS_HALL = "/api/v1/close/recharge/getPaymentRecordListForHall"
+
 # Request Parameters (根据抓包数据修正)
 PARAM_CID = "cid"
 PARAM_USER_CODE = "userCode"

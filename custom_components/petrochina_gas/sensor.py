@@ -93,7 +93,6 @@ from .const import (
     ATTR_KEY_LADDER_UNIT_PRICE,
     ATTR_KEY_LAST_PAYMENT_DATE,
     ATTR_KEY_LAST_PAYMENT_AMOUNT,
-    DATA_TOTAL_GAS_VOLUME,
 )
 from .gas_client import GasHttpClient
 
@@ -817,7 +816,7 @@ class GasCoordinator(DataUpdateCoordinator):
                     "meter_type": user_debt.meter_type,
                     "mdm_code": user_debt.mdm_code,
                     "user_code": user_debt.user_code,
-                    "gas_company": get_company_display_name(user_debt.mdm_code, cid),
+                    "gas_company": client.company_name or get_company_display_name(user_debt.mdm_code, cid),
                 })
                 if user_debt.mdm_code:
                     client._mdm_code = user_debt.mdm_code
@@ -826,8 +825,8 @@ class GasCoordinator(DataUpdateCoordinator):
             _LOGGER.error(f"Error getting user debt for {user_code}: {err}")
 
         # 2. 如果已登录，获取认证后的数据
-        has_auth = hasattr(client, '_get_auth_token') and bool(client._get_auth_token()) and bool(client._mdm_code)
-        _LOGGER.info(f"Checking auth for {user_code}: has_token={bool(client._get_auth_token())}, has_mdm={bool(client._mdm_code)}")
+        has_auth = bool(client._get_auth_token())
+        _LOGGER.info(f"Checking auth for {user_code}: has_token={has_auth}, has_mdm={bool(client._mdm_code)}")
 
         if has_auth:
             # 获取缴费记录
@@ -871,170 +870,49 @@ class GasCoordinator(DataUpdateCoordinator):
                     SUFFIX_OWE_AMOUNT: 0,
                 })
 
-            # 获取月度用量（包含阶梯价格信息）
+            # 获取用量汇总（2026-11 平台升级后改用 getUserGasVolume 每日账单聚合）
+            usage_defaults = {
+                SUFFIX_MONTHLY_VOLUME: 0,
+                SUFFIX_MONTHLY_COST: 0,
+                SUFFIX_CURRENT_MONTH_VOLUME: 0,
+                SUFFIX_CURRENT_MONTH_COST: 0,
+                SUFFIX_YEARLY_VOLUME: 0,
+                SUFFIX_YEARLY_COST: 0,
+                ATTR_KEY_LADDER_STAGE: 1,
+                ATTR_KEY_LADDER_UNIT_PRICE: 0,
+                SUFFIX_LAST_DAY_USAGE: 0,
+                SUFFIX_LAST_DAY_USAGE_TIME: "",
+                SUFFIX_LAST_DAY_USAGE_COST: 0,
+                SUFFIX_RECENT_MONTHLY_USAGE: 0,
+                SUFFIX_RECENT_MONTHLY_COST: 0,
+            }
             try:
-                monthly_data = await call_with_relogin(
-                    client.get_monthly_usage,
-                    1,  # page
-                    7   # page_size (7 months)
-                )
-
-                if monthly_data and "error" not in monthly_data:
-                    # 解析阶梯价格配置
-                    rate_items = monthly_data.get("rateItemInfo", [])
-
-                    # 构建阶梯配置列表
-                    ladder_config = []
-                    for item in rate_items:
-                        ladder_config.append({
-                            "start": float(item.get("beginVolume", 0)),
-                            "end": float(item.get("endVolume", float("inf"))),
-                            "price": float(item.get("price", 0)),
-                        })
-
-                    # 解析月度用量记录
-                    records = monthly_data.get("recordsInfo", [])
-
-                    # 直接从API获取本年累计用量（阶梯信息中的实时数据）
-                    yearly_volume = float(monthly_data.get(DATA_TOTAL_GAS_VOLUME, 0))
-
-                    if len(records) >= 2:
-                        # 获取数据
-                        last_month = records[-2]  # 上月
-                        current_month = records[-1]  # 当前月
-
-                        last_month_volume = float(last_month.get("gasVolume", 0))
-                        current_month_volume = float(current_month.get("gasVolume", 0))
-
-                        # 计算费用：使用用量和阶梯配置计算
-                        _, _, last_month_cost = calculate_cost_by_ladder(last_month_volume, ladder_config)
-                        _, _, current_month_cost_calc = calculate_cost_by_ladder(current_month_volume, ladder_config)
-
-                        account_data.update({
-                            SUFFIX_MONTHLY_VOLUME: last_month_volume,
-                            SUFFIX_MONTHLY_COST: last_month_cost,  # 使用计算值而非API返回值
-                            SUFFIX_CURRENT_MONTH_VOLUME: current_month_volume,  # 本月用量
-                            SUFFIX_CURRENT_MONTH_COST: current_month_cost_calc,  # 使用计算值
-                        })
-
-                        # 使用计算函数确定当前阶梯和费用
-                        current_ladder, ladder_unit_price, yearly_cost_calc = calculate_cost_by_ladder(yearly_volume, ladder_config)
-
-                        account_data.update({
-                            SUFFIX_YEARLY_VOLUME: yearly_volume,
-                            SUFFIX_YEARLY_COST: yearly_cost_calc,  # 使用计算值
-                            ATTR_KEY_LADDER_STAGE: current_ladder,
-                            ATTR_KEY_LADDER_UNIT_PRICE: ladder_unit_price,
-                        })
-                    elif len(records) == 1:
-                        # 只有一个月的数据
-                        current_month = records[0]
-                        current_month_volume = float(current_month.get("gasVolume", 0))
-                        _, _, current_month_cost = calculate_cost_by_ladder(current_month_volume, ladder_config)
-
-                        account_data.update({
-                            SUFFIX_MONTHLY_VOLUME: 0,
-                            SUFFIX_MONTHLY_COST: 0,
-                            SUFFIX_CURRENT_MONTH_COST: current_month_cost,
-                            SUFFIX_YEARLY_VOLUME: current_month_volume,
-                            SUFFIX_YEARLY_COST: current_month_cost,
-                            ATTR_KEY_LADDER_STAGE: 1,
-                            ATTR_KEY_LADDER_UNIT_PRICE: ladder_config[0]["price"],
-                        })
-                    else:
-                        account_data.update({
-                            SUFFIX_MONTHLY_VOLUME: 0,
-                            SUFFIX_MONTHLY_COST: 0,
-                            SUFFIX_CURRENT_MONTH_COST: 0,
-                            SUFFIX_YEARLY_VOLUME: 0,
-                            SUFFIX_YEARLY_COST: 0,
-                            ATTR_KEY_LADDER_STAGE: 1,
-                            ATTR_KEY_LADDER_UNIT_PRICE: 0,
-                        })
-
-            except Exception as err:
-                _LOGGER.error(f"Error getting monthly usage for {user_code}: {err}")
-                account_data.update({
-                    SUFFIX_MONTHLY_VOLUME: 0,
-                    SUFFIX_MONTHLY_COST: 0,
-                    SUFFIX_CURRENT_MONTH_VOLUME: 0,
-                    SUFFIX_CURRENT_MONTH_COST: 0,
-                    SUFFIX_YEARLY_VOLUME: 0,
-                    SUFFIX_YEARLY_COST: 0,
-                    ATTR_KEY_LADDER_STAGE: 1,
-                    ATTR_KEY_LADDER_UNIT_PRICE: 0,
-                })
-
-            # 获取每日用量（用于last_day_usage和recent_usage）
-            try:
-                daily_usage = await call_with_relogin(
-                    client.get_daily_usage,
-                    31  # 31 days
-                )
-
-                _LOGGER.debug(f"Daily usage response for {user_code}: {daily_usage}")
-
-                if daily_usage and "daily_volumes" in daily_usage:
-                    daily_volumes = daily_usage["daily_volumes"]
-                    _LOGGER.info(f"✅ Got {len(daily_volumes)} daily records for {user_code}")
-
-                    if daily_volumes:
-                        # 最近一天数据 (索引0是最新的)
-                        last_day = daily_volumes[0]
-                        last_day_volume = last_day.get("volume", 0)
-                        last_day_reading = last_day.get("reading", 0)  # 表读数
-
-                        account_data.update({
-                            SUFFIX_LAST_DAY_USAGE: last_day_volume,
-                            SUFFIX_LAST_DAY_USAGE_TIME: last_day.get("date", ""),
-                            SUFFIX_METER_READING: last_day_reading,  # 更新表读数为最新值
-                        })
-
-                        # 计算近31天累计用量和费用
-                        recent_monthly_volume = sum(d.get("volume", 0) for d in daily_volumes)
-
-                        # 获取当前阶梯单价用于计算费用
-                        ladder_unit_price = account_data.get(ATTR_KEY_LADDER_UNIT_PRICE, 0)
-
-                        # 新增：计算最近一日用气费用
-                        last_day_cost = round(last_day_volume * ladder_unit_price, 2)
-
-                        recent_monthly_cost = round(recent_monthly_volume * ladder_unit_price, 2)
-
-                        account_data.update({
-                            SUFFIX_RECENT_MONTHLY_USAGE: recent_monthly_volume,  # 近31天累计
-                            SUFFIX_RECENT_MONTHLY_COST: recent_monthly_cost,  # 近31天费用
-                            SUFFIX_LAST_DAY_USAGE_COST: last_day_cost,  # 最近一日费用（新增）
-                        })
-                    else:
-                        account_data.update({
-                            SUFFIX_LAST_DAY_USAGE: 0,
-                            SUFFIX_LAST_DAY_USAGE_TIME: "",
-                            SUFFIX_RECENT_MONTHLY_USAGE: 0,
-                            SUFFIX_RECENT_MONTHLY_COST: 0,
-                            SUFFIX_LAST_DAY_USAGE_COST: 0,  # 最近一日费用（新增）
-                        })
-                else:
+                summary = await call_with_relogin(client.get_usage_summary)
+                if summary:
                     account_data.update({
-                        SUFFIX_LAST_DAY_USAGE: 0,
-                        SUFFIX_LAST_DAY_USAGE_TIME: "",
-                        SUFFIX_RECENT_MONTHLY_USAGE: 0,
-                        SUFFIX_RECENT_MONTHLY_COST: 0,
-                        SUFFIX_LAST_DAY_USAGE_COST: 0,  # 最近一日费用（新增）
+                        SUFFIX_MONTHLY_VOLUME: summary["monthly_volume"],
+                        SUFFIX_MONTHLY_COST: summary["monthly_cost"],
+                        SUFFIX_CURRENT_MONTH_VOLUME: summary["current_month_volume"],
+                        SUFFIX_CURRENT_MONTH_COST: summary["current_month_cost"],
+                        SUFFIX_YEARLY_VOLUME: summary["yearly_volume"],
+                        SUFFIX_YEARLY_COST: summary["yearly_cost"],
+                        ATTR_KEY_LADDER_STAGE: summary["ladder_stage"],
+                        ATTR_KEY_LADDER_UNIT_PRICE: summary["ladder_unit_price"],
+                        SUFFIX_LAST_DAY_USAGE: summary["last_day_volume"],
+                        SUFFIX_LAST_DAY_USAGE_TIME: summary["last_day_date"],
+                        SUFFIX_LAST_DAY_USAGE_COST: summary["last_day_cost"],
+                        SUFFIX_RECENT_MONTHLY_USAGE: summary["recent_monthly_volume"],
+                        SUFFIX_RECENT_MONTHLY_COST: summary["recent_monthly_cost"],
+                        SUFFIX_METER_READING: summary["meter_reading"],
+                        SUFFIX_BAL: summary["balance"],
+                        SUFFIX_LAST_COMMUNICATION: parse_datetime(summary["last_communication"]),
                     })
+                else:
+                    _LOGGER.warning(f"No usage summary for {user_code}, using defaults")
+                    account_data.update(usage_defaults)
             except Exception as err:
-                _LOGGER.error(f"Error getting daily usage for {user_code}: {err}")
-                account_data.update({
-                    SUFFIX_LAST_DAY_USAGE: 0,
-                    SUFFIX_LAST_DAY_USAGE_TIME: "",
-                    SUFFIX_RECENT_MONTHLY_USAGE: 0,
-                    SUFFIX_RECENT_MONTHLY_COST: 0,
-                    SUFFIX_LAST_DAY_USAGE_COST: 0,  # 最近一日费用（新增）
-                })
-
-            # 同样需要更新异常处理中的 current_month_volume
-            if SUFFIX_CURRENT_MONTH_VOLUME not in account_data:
-                account_data[SUFFIX_CURRENT_MONTH_VOLUME] = 0
+                _LOGGER.error(f"Error getting usage summary for {user_code}: {err}")
+                account_data.update(usage_defaults)
 
         else:
             # 未登录时，设置默认值
@@ -1112,7 +990,7 @@ class GasCoordinator(DataUpdateCoordinator):
                     "meter_type": user_debt.meter_type,
                     "mdm_code": user_debt.mdm_code,
                     "user_code": user_debt.user_code,
-                    "gas_company": get_company_display_name(user_debt.mdm_code, cid),
+                    "gas_company": client.company_name or get_company_display_name(user_debt.mdm_code, cid),
                 })
                 # 设置 mdm_code 到 client
                 if user_debt.mdm_code:

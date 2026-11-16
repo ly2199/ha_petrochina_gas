@@ -5,6 +5,7 @@ import requests
 import json
 import base64
 import hashlib
+from datetime import datetime, timedelta, timezone
 from typing import Optional, Tuple, Dict, Any
 from cryptography.hazmat.primitives import serialization, hashes
 from cryptography.hazmat.primitives.asymmetric import rsa, padding
@@ -26,6 +27,10 @@ from .const import (
     API_GET_PAYMENT_RECORDS,
     API_GET_MONTHLY_VOLUME,
     API_REFRESH_TOKEN,
+    API_GET_GAS_COMPANY_LIST,
+    API_GET_USER_MESSAGE,
+    API_GET_USER_GAS_VOLUME,
+    API_GET_PAYMENT_RECORDS_HALL,
     PARAM_CID,
     PARAM_USER_CODE,
     PARAM_TERMINAL_TYPE,
@@ -59,6 +64,16 @@ from .models import GasAccount, LadderPricing, CSGAPIError
 
 _LOGGER = logging.getLogger(__name__)
 
+# 公司列表缓存（cid -> {mdmCode, name}），进程内共享，避免重复拉取
+_COMPANY_CACHE: Dict[int, Dict[str, str]] = {}
+# 已知公司静态映射（接口拉取失败时兜底）
+_KNOWN_COMPANIES = {
+    5000000883: {"mdmCode": "9AHA", "name": "红河中石油昆仑燃气有限公司"},
+    2: {"mdmCode": "9AH1", "name": "云南中石油昆仑燃气有限公司昆明分公司"},
+}
+# 账单记录时区（平台返回北京时间）
+_CN_TZ = timezone(timedelta(hours=8))
+
 
 class GasHttpClient:
     """昆仑燃气 HTTP 客户端"""
@@ -88,6 +103,11 @@ class GasHttpClient:
 
         # 缓存 AES 密钥（用于密码登录）
         self._cached_aes_key: Optional[str] = None
+
+        # 年度用量累计缓存（避免每次刷新都翻完整历史页）
+        self._yearly_cache: Optional[Dict[str, Any]] = None
+        # 公司名称（解析 mdmCode 时顺带缓存）
+        self.company_name: Optional[str] = None
 
         # 设置默认请求头
         self._session.headers.update({
@@ -745,46 +765,311 @@ class GasHttpClient:
             return result
         return result.get("data", []) if isinstance(result, dict) else []
 
+    def resolve_mdm_code(self, cid: int) -> Optional[str]:
+        """根据 cid 解析 mdmCode（优先缓存/静态映射，其次拉取公司列表）"""
+        if self._mdm_code:
+            return self._mdm_code
+        cached = _COMPANY_CACHE.get(cid) or _KNOWN_COMPANIES.get(cid)
+        if cached:
+            self.company_name = cached.get("name")
+            return cached.get("mdmCode")
+        try:
+            response = self._make_request(API_GET_GAS_COMPANY_LIST, data={}, requires_auth=False)
+            payload = response.json()
+            for area in payload.get("data", []):
+                if not isinstance(area, dict):
+                    continue
+                for group in (area.get("companyList") or {}).values():
+                    if not isinstance(group, list):
+                        continue
+                    for comp in group:
+                        if not isinstance(comp, dict):
+                            continue
+                        comp_id = comp.get("id")
+                        if comp_id is None:
+                            continue
+                        entry = {"mdmCode": comp.get("mdmCode", ""), "name": comp.get("name", "")}
+                        _COMPANY_CACHE[int(comp_id)] = entry
+                        if int(comp_id) == int(cid):
+                            self.company_name = entry["name"]
+                            self._mdm_code = entry["mdmCode"]
+            if self._mdm_code:
+                return self._mdm_code
+        except Exception as err:
+            _LOGGER.warning(f"Failed to fetch company list: {err}")
+        return None
+
+    def get_user_message(self) -> Optional[dict]:
+        """查询客户基本信息（营业厅模式，无需户号绑定）"""
+        if not self.is_logged_in():
+            _LOGGER.error("Not logged in. Please login first.")
+            return None
+        mdm_code = self.resolve_mdm_code(self.cid)
+        if not mdm_code:
+            _LOGGER.error("Cannot resolve mdmCode for cid=%s", self.cid)
+            return None
+        data = {"mdmCode": mdm_code, PARAM_USER_CODE: self.user_code}
+        response = self._make_request(API_GET_USER_MESSAGE, data=data, requires_auth=True)
+        result = self._parse_response(response)
+        if "error" in result:
+            _LOGGER.error(f"Failed to get user message: {result['error']}")
+            return None
+        return result
+
+    def get_user_gas_volume(self, page_no: int = 1) -> Optional[dict]:
+        """查询物联网表每日账单记录（营业厅模式，无需户号绑定）
+
+        Returns:
+            {"records": [{date, volume, cost, reading, last_reading, balance}...],
+             "records_count": int}
+            记录按时间倒序（最新在前），每页固定10条。
+        """
+        if not self.is_logged_in():
+            _LOGGER.error("Not logged in. Please login first.")
+            return None
+        mdm_code = self.resolve_mdm_code(self.cid)
+        if not mdm_code:
+            _LOGGER.error("Cannot resolve mdmCode for cid=%s", self.cid)
+            return None
+        data = {"mdmCode": mdm_code, PARAM_USER_CODE: self.user_code, "pageNo": page_no}
+        response = self._make_request(API_GET_USER_GAS_VOLUME, data=data, requires_auth=True)
+        result = self._parse_response(response)
+        if "error" in result:
+            _LOGGER.error(f"Failed to get user gas volume: {result['error']}")
+            return None
+        records = []
+        for item in result.get("userCodeList") or []:
+            try:
+                records.append({
+                    "date": item.get("blDttm", ""),
+                    "volume": float(item.get("billingVolume") or 0),
+                    "cost": float(item.get("amount") or 0),
+                    "reading": float(item.get("read") or 0),
+                    "last_reading": float(item.get("lastRead") or 0),
+                    "balance": float(item.get("balance") or 0),
+                })
+            except (TypeError, ValueError):
+                continue
+        try:
+            records_count = int(result.get("recordsCount") or 0)
+        except (TypeError, ValueError):
+            records_count = 0
+        return {"records": records, "records_count": records_count}
+
+    def get_usage_summary(self) -> Optional[dict]:
+        """基于每日账单记录汇总各周期用量/费用/阶梯单价。
+
+        平台升级后 getMonthlyTotalGasVolume / smartMeterGasDaysRecords 对未绑定
+        户号不可用，改用 getUserGasVolume（每页10条）翻页聚合：
+        - 每次刷新固定翻7页（约70天），覆盖昨日/近31天/本月/上月；
+        - 年度累计首次翻到年初为止，之后用缓存增量累加。
+        """
+        if not self.is_logged_in():
+            return None
+
+        base_pages = 7
+        records: list = []
+        records_count = 0
+        for page in range(1, base_pages + 1):
+            page_data = self.get_user_gas_volume(page)
+            if not page_data:
+                break
+            records_count = page_data["records_count"]
+            batch = page_data["records"]
+            if not batch:
+                break
+            records.extend(batch)
+            if len(records) >= records_count:
+                break
+
+        if not records:
+            return None
+
+        now = datetime.now(_CN_TZ)
+        year_start = datetime(now.year, 1, 1, tzinfo=_CN_TZ)
+        month_start = datetime(now.year, now.month, 1, tzinfo=_CN_TZ)
+        if now.month == 1:
+            last_month_start = datetime(now.year - 1, 12, 1, tzinfo=_CN_TZ)
+        else:
+            last_month_start = datetime(now.year, now.month - 1, 1, tzinfo=_CN_TZ)
+        recent_start = now - timedelta(days=31)
+
+        def parse_dt(s: str) -> Optional[datetime]:
+            try:
+                return datetime.strptime(s, "%Y-%m-%d %H:%M:%S").replace(tzinfo=_CN_TZ)
+            except (ValueError, TypeError):
+                return None
+
+        last_day = records[0]
+        recent_volume = recent_cost = 0.0
+        cur_month_volume = cur_month_cost = 0.0
+        last_month_volume = last_month_cost = 0.0
+        for rec in records:
+            dt = parse_dt(rec["date"])
+            if dt is None:
+                continue
+            if dt >= recent_start:
+                recent_volume += rec["volume"]
+                recent_cost += rec["cost"]
+            if dt >= month_start:
+                cur_month_volume += rec["volume"]
+                cur_month_cost += rec["cost"]
+            elif dt >= last_month_start:
+                last_month_volume += rec["volume"]
+                last_month_cost += rec["cost"]
+
+        # 年度累计：缓存命中则增量累加，否则继续翻页到年初
+        yearly_volume = yearly_cost = 0.0
+        scan_complete = True
+        cache = self._yearly_cache
+        if cache and cache.get("year") == now.year and cache.get("complete"):
+            cutoff = parse_dt(cache.get("last_dt", ""))
+            yearly_volume = cache.get("volume", 0.0)
+            yearly_cost = cache.get("cost", 0.0)
+            for rec in records:
+                dt = parse_dt(rec["date"])
+                if dt is None or (cutoff and dt <= cutoff):
+                    continue
+                if dt >= year_start:
+                    yearly_volume += rec["volume"]
+                    yearly_cost += rec["cost"]
+        else:
+            all_records = list(records)
+            page = base_pages
+            reached_year_start = any(
+                (parse_dt(r["date"]) or now) < year_start for r in records
+            )
+            while not reached_year_start and len(all_records) < records_count and page < 80:
+                page += 1
+                page_data = self.get_user_gas_volume(page)
+                if not page_data or not page_data["records"]:
+                    break
+                batch = page_data["records"]
+                all_records.extend(batch)
+                if any((parse_dt(r["date"]) or now) < year_start for r in batch):
+                    reached_year_start = True
+            for rec in all_records:
+                dt = parse_dt(rec["date"])
+                if dt and dt >= year_start:
+                    yearly_volume += rec["volume"]
+                    yearly_cost += rec["cost"]
+            records = all_records
+            scan_complete = reached_year_start or len(all_records) >= records_count
+
+        self._yearly_cache = {
+            "year": now.year,
+            "volume": yearly_volume,
+            "cost": yearly_cost,
+            "last_dt": records[0]["date"],
+            "complete": scan_complete,
+        }
+
+        # 当前有效单价（最新账单 金额/用量）；阶梯档位接口已不可用，返回0表示未知
+        ladder_unit_price = 0.0
+        for rec in records:
+            if rec["volume"] > 0:
+                ladder_unit_price = round(rec["cost"] / rec["volume"], 2)
+                break
+
+        return {
+            "last_day_volume": last_day["volume"],
+            "last_day_cost": round(last_day["cost"], 2),
+            "last_day_date": last_day["date"],
+            "meter_reading": last_day["reading"],
+            "balance": last_day["balance"],
+            "last_communication": last_day["date"],
+            "recent_monthly_volume": round(recent_volume, 2),
+            "recent_monthly_cost": round(recent_cost, 2),
+            "current_month_volume": round(cur_month_volume, 2),
+            "current_month_cost": round(cur_month_cost, 2),
+            "monthly_volume": round(last_month_volume, 2),
+            "monthly_cost": round(last_month_cost, 2),
+            "yearly_volume": round(yearly_volume, 2),
+            "yearly_cost": round(yearly_cost, 2),
+            "ladder_stage": 0,
+            "ladder_unit_price": ladder_unit_price,
+        }
+
     def get_user_debt(self) -> Optional[GasAccount]:
         """
         查询用户余额
 
-        Returns:
-            包含余额等信息的字典
-        """
-        # 如果有 token，使用 close API 获取完整数据（包括 userCodeList）
-        if self._get_auth_token():
-            url = API_GET_USER_DEBT_AUTH
-        else:
-            url = API_GET_USER_DEBT
+        2026-11 平台升级后 close/getUserDebt 改为需要绑定后的 userCodeId，
+        且部分公司（如红河）收费系统迁移导致绑定/公开查询接口失效。
+        优先走营业厅模式接口（getUserMessage + getUserGasVolume），
+        已绑定账户走新版 getUserDebt，未登录时回退公开接口。
 
+        Returns:
+            GasAccount 对象，失败返回 None
+        """
+        if self._get_auth_token():
+            # 1) 已绑定账户：getUserCode 拿 userCodeId，再调新版 getUserDebt
+            try:
+                list_data = {PARAM_CID: self.cid, PARAM_TERMINAL_TYPE: 1}
+                response = self._make_request(API_GET_CUSTOMER_INFO, data=list_data, requires_auth=True)
+                result = self._parse_response(response)
+                if isinstance(result, list):
+                    for item in result:
+                        if str(item.get("userCode")) == str(self.user_code):
+                            self._user_code_id = str(item.get("id", ""))
+                            break
+                if self._user_code_id:
+                    debt_data = {PARAM_CID: self.cid, PARAM_USER_CODE_ID: self._user_code_id}
+                    response = self._make_request(API_GET_USER_DEBT_AUTH, data=debt_data, requires_auth=True)
+                    result = self._parse_response(response)
+                    if "error" not in result and result:
+                        return self._account_from_debt(result)
+            except Exception as err:
+                _LOGGER.debug(f"Bound-account getUserDebt failed, fallback to hall API: {err}")
+
+            # 2) 营业厅模式：客户信息 + 最新账单（无需绑定）
+            try:
+                message = self.get_user_message()
+                volume = self.get_user_gas_volume(1)
+                latest = (volume or {}).get("records", [{}])[0] if volume and volume["records"] else {}
+                if message or latest:
+                    message = message or {}
+                    balance = latest.get("balance")
+                    if balance is None:
+                        balance = message.get("balance", 0)
+                    mdm_code = self._mdm_code or self.resolve_mdm_code(self.cid) or ""
+                    return GasAccount(
+                        account_id="",
+                        user_code=self.user_code,
+                        customer_name=message.get("customerName", ""),
+                        address=message.get("address", ""),
+                        remote_meter_balance=float(balance or 0),
+                        meter_type=message.get("modelType", ""),
+                        mdm_code=mdm_code,
+                        reading_last_time=str(latest.get("reading", message.get("lastBaseVolume", ""))),
+                        remote_meter_last_communication_time=latest.get("date", ""),
+                        user_code_id=self._user_code_id,
+                    )
+            except Exception as err:
+                _LOGGER.error(f"Hall API get_user_debt failed: {err}")
+            return None
+
+        # 3) 未登录：公开接口（部分公司仍可用）
         data = {
             PARAM_CID: self.cid,
             PARAM_USER_CODE: self.user_code,
             PARAM_TERMINAL_TYPE: self.terminal_type,
         }
-
-        # 如果有 token，使用认证请求以获取完整的 userCodeList
-        requires_auth = bool(self._get_auth_token())
-
-        _LOGGER.info(f"Querying user debt: {self.user_code}")
-        response = self._make_request(url, data=data, requires_auth=requires_auth)
+        _LOGGER.info(f"Querying user debt (public API): {self.user_code}")
+        response = self._make_request(API_GET_USER_DEBT, data=data, requires_auth=False)
         result = self._parse_response(response)
-
         if "error" in result:
             _LOGGER.error(f"Failed to get user debt: {result['error']}")
             return None
+        return self._account_from_debt(result)
 
-        account_data = result
-
-        # 提取 userCodeId（从 userCodeList）
+    def _account_from_debt(self, account_data: dict) -> GasAccount:
+        """从 getUserDebt 响应构造 GasAccount"""
         user_code_id = None
         user_code_list = account_data.get("userCodeList", [])
         if user_code_list and len(user_code_list) > 0:
             user_code_id = str(user_code_list[0].get("id", ""))
-            # 缓存到实例变量中供后续使用
             self._user_code_id = user_code_id
-
         return GasAccount(
             account_id=account_data.get(DATA_ACCOUNT_ID, ""),
             user_code=account_data.get(PARAM_USER_CODE, self.user_code),
@@ -929,6 +1214,9 @@ class GasHttpClient:
         """
         查询缴费记录（需要认证）
 
+        优先走营业厅接口 getPaymentRecordListForHall（无需户号绑定），
+        失败时回退到需要 userCodeId 的 getPaymentRecordList。
+
         Args:
             page: 页码（默认1）
             page_size: 每页数量（默认10）
@@ -940,6 +1228,31 @@ class GasHttpClient:
         if not self.is_logged_in():
             _LOGGER.error("Not logged in. Please login first.")
             return None
+
+        _LOGGER.info(f"Querying payment records: {self.user_code}")
+
+        mdm_code = self._mdm_code or self.resolve_mdm_code(self.cid)
+        if mdm_code:
+            hall_data = {
+                PARAM_CID: self.cid,
+                "mdmCode": mdm_code,
+                PARAM_USER_CODE: self.user_code,
+                PARAM_PAGE_NUMBER: page,
+                PARAM_PAGE_SIZE: page_size,
+            }
+            try:
+                response = self._make_request(API_GET_PAYMENT_RECORDS_HALL, data=hall_data, requires_auth=True)
+                result = self._parse_response(response)
+                if "error" not in result:
+                    for record in result.get("recordsInfoList") or []:
+                        op_date = record.get("operationDate") or ""
+                        op_time = record.get("operationTime") or ""
+                        if op_date and op_time:
+                            record["operationDate"] = f"{op_date} {op_time}"
+                    return result
+                _LOGGER.warning(f"Payment records (hall) error: {result['error']}")
+            except Exception as err:
+                _LOGGER.warning(f"Payment records (hall) failed, fallback: {err}")
 
         url = API_GET_PAYMENT_RECORDS
         data = {
@@ -955,7 +1268,6 @@ class GasHttpClient:
         else:
             _LOGGER.warning("userCodeId not available, payment records may fail")
 
-        _LOGGER.info(f"Querying payment records: {self.user_code}")
         response = self._make_request(url, data=data, requires_auth=True)
         result = self._parse_response(response)
 
